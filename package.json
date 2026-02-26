@@ -1,0 +1,39 @@
+{
+  "name": "diamondbch",
+  "version": "1.0.0",
+  "description": "DiamondBCH — Liquid Staking on Bitcoin Cash",
+  "type": "module",
+  "scripts": {
+    "compile": "cashc contracts/LiquidStake.cash -o LiquidStake.json",
+    "deploy": "tsx src/deploy.ts",
+    "stake": "tsx src/stake.ts",
+    "unstake": "tsx src/unstake.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "mocknet": "tsx src/test-mocknet.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/3scava1i3r/DiamondBCH.git"
+  },
+  "keywords": [
+    "bch",
+    "liquid-staking",
+    "cashscript",
+    "cashtokens"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "bs58check": "^4.0.0",
+    "cashc": "^0.12.1",
+    "cashscript": "^0.12.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@vitest/coverage-v8": "^4.0.18",
+    "tsx": "^4.21.0",
+    "typescript": "^5.0.0",
+    "vitest": "^4.0.18"
+  }
+}

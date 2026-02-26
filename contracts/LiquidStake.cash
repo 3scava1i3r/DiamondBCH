@@ -1,0 +1,90 @@
+pragma cashscript ^0.12.0;
+
+// LiquidStake — Stake BCH → get lstBCH NFT receipt → unstake with yield
+//
+// The contract holds a minting NFT. On stake, it mints an immutable receipt NFT
+// whose commitment encodes the staked sats amount. On unstake, the receipt NFT
+// is burned and BCH is returned.
+//
+// NFT commitment layout: bytes8(stakedAmount)
+
+contract LiquidStake(bytes20 ownerPkh) {
+
+    // Stake BCH into the pool and receive an lstBCH receipt NFT.
+    // Input 0: contract UTXO (minting NFT)
+    // Input 1: user's BCH funding input
+    // Output 0: contract UTXO with minting NFT preserved (covenant)
+    // Output 1: receipt NFT sent to user
+    // Output 2: (optional) BCH change back to user
+    function stake() {
+        require(this.activeInputIndex == 0);
+
+        // Covenant: contract bytecode must be preserved
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+
+        // Covenant: minting NFT must be preserved (category + 0x02 capability)
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+
+        // Calculate how much BCH was added to the pool
+        int satsAdded = tx.outputs[0].value - tx.inputs[0].value;
+        require(satsAdded >= 10000);
+
+        // Mint a receipt NFT: same category, no capability (immutable)
+        bytes tokenCategoryReceipt = tx.inputs[0].tokenCategory.split(32)[0];
+        require(tx.outputs[1].tokenCategory == tokenCategoryReceipt);
+
+        // Receipt NFT commitment = staked amount
+        require(tx.outputs[1].nftCommitment == bytes8(satsAdded));
+
+        // Receipt goes to the user (input 1's address)
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+
+        // Cap outputs to prevent unauthorized extra minting
+        require(tx.outputs.length <= 3);
+
+        // If there's a change output, it must not carry tokens
+        if (tx.outputs.length == 3) {
+            require(tx.outputs[2].tokenCategory == 0x);
+        }
+    }
+
+    // Unstake: return receipt NFT to get BCH back.
+    // Input 0: contract UTXO (minting NFT)
+    // Input 1: user's receipt NFT
+    // Output 0: contract UTXO with minting NFT preserved (covenant)
+    // Output 1: BCH payout to user (receipt NFT is burned)
+    function unstake() {
+        require(this.activeInputIndex == 0);
+
+        // Covenant: contract bytecode must be preserved
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+
+        // Covenant: minting NFT must be preserved
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+
+        // Validate receipt NFT: same category, no capability suffix (immutable)
+        bytes tokenCategoryReceipt = tx.inputs[0].tokenCategory.split(32)[0];
+        require(tx.inputs[1].tokenCategory == tokenCategoryReceipt);
+
+        // Read staked amount from receipt commitment
+        int stakedAmount = int(tx.inputs[1].nftCommitment);
+
+        // Pool BCH decreases by payout amount
+        require(tx.outputs[0].value >= tx.inputs[0].value - stakedAmount);
+
+        // Payout goes to the receipt holder
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+
+        // Only 2 outputs: contract + payout (burns the receipt NFT)
+        require(tx.outputs.length == 2);
+
+        // Burn the receipt: output 1 must carry no tokens
+        require(tx.outputs[1].tokenCategory == 0x);
+    }
+
+    // Owner can withdraw excess / manage the pool
+    function withdraw(pubkey pk, sig s) {
+        require(hash160(pk) == ownerPkh);
+        require(checkSig(s, pk));
+    }
+}
