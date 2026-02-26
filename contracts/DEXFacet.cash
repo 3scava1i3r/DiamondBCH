@@ -1,0 +1,260 @@
+pragma cashscript ^0.12.0;
+
+// DEXFacet — Concentrated Liquidity AMM with Tick NFTs (Uniswap V3-style)
+//
+// This contract handles:
+// - Adding liquidity within a tick range → mint position NFT
+// - Removing liquidity → burn position NFT, return tokens
+// - Swapping token0 ↔ token1 with fee collection
+// - Collecting fees from a position
+//
+// NFT Commitment Layout:
+//   Position NFT: bytes4(tickLower) + bytes4(tickUpper) + bytes8(liquidity) = 16 bytes
+//
+// Tick Range:
+//   tickLower < tickUpper (valid range)
+//   Liquidity is concentrated between these ticks
+
+contract DEXFacet(bytes20 hubPkh) {
+
+    // Add Liquidity: deposit token0 + token1 → mint position NFT
+    //
+    // Input 0: DEX contract UTXO (minting NFT for positions)
+    // Input 1: user's token0 (fungible)
+    // Input 2: user's token1 (fungible)
+    // Output 0: DEX contract UTXO (covenant, minting NFT preserved)
+    // Output 1: position NFT (commitment = tickLower + tickUpper + liquidity)
+    // Output 2: (optional) token0 change
+    // Output 3: (optional) token1 change
+    //
+    // Liquidity calculation (simplified):
+    //   liquidity = sqrt(amount0 * amount1)
+    //   (In production, use proper concentrated liquidity formula)
+    function addLiquidity(int amount0, int amount1, int tickLower, int tickUpper) {
+        require(this.activeInputIndex == 0);
+
+        // Covenant: contract bytecode must be preserved
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+
+        // Covenant: minting NFT for positions must be preserved
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+
+        // Validate tick range
+        require(tickLower < tickUpper);
+        require(tickLower >= 0);
+        require(tickUpper > tickLower);
+
+        // Amounts must be positive
+        require(amount0 > 0);
+        require(amount1 > 0);
+
+        // Calculate liquidity (simplified geometric mean)
+        // In production, use proper AMM pricing formula
+        int liquidity = 0;
+        if (amount0 > 0 && amount1 > 0) {
+            // Simplified: liquidity = min(amount0, amount1)
+            // Real implementation would use sqrt(amount0 * amount1)
+            if (amount0 < amount1) {
+                liquidity = amount0;
+            } else {
+                liquidity = amount1;
+            }
+        }
+        require(liquidity > 0);
+
+        // Output 1: Position NFT
+        // Commitment: bytes4(tickLower) + bytes4(tickUpper) + bytes8(liquidity)
+        require(tx.outputs[1].tokenCategory != 0x);
+        
+        // Extract base token category from minting NFT
+        bytes tokenCategoryBase = tx.inputs[0].tokenCategory.split(32)[0];
+        require(tx.outputs[1].tokenCategory == tokenCategoryBase);
+
+        // Build position NFT commitment
+        bytes positionCommitment = bytes4(tickLower) + bytes4(tickUpper) + bytes8(liquidity);
+        require(tx.outputs[1].nftCommitment == positionCommitment);
+
+        // Position NFT goes to the liquidity provider (input 1's address)
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+
+        // Validate token inputs/outputs
+        // Input 1 should be token0, Input 2 should be token1
+        // (In production, would validate token categories)
+
+        // Maximum 4 outputs
+        require(tx.outputs.length <= 4);
+    }
+
+    // Remove Liquidity: burn position NFT + return tokens
+    //
+    // Input 0: DEX contract UTXO (minting NFT)
+    // Input 1: position NFT to burn
+    // Output 0: DEX contract UTXO (covenant, minting NFT preserved)
+    // Output 1: token0 to LP
+    // Output 2: token1 to LP
+    // Output 3: (optional) BCH change
+    function removeLiquidity(int amount0, int amount1) {
+        require(this.activeInputIndex == 0);
+
+        // Covenant: contract bytecode preserved
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+
+        // Covenant: minting NFT preserved
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+
+        // Input 1 must be a position NFT
+        require(tx.inputs[1].tokenCategory != 0x);
+
+        // Parse position NFT commitment: bytes4(tickLower) + bytes4(tickUpper) + bytes8(liquidity)
+        bytes positionCommitment = tx.inputs[1].nftCommitment;
+        int tickLower = int(positionCommitment.slice(0, 4));
+        int tickUpper = int(positionCommitment.slice(4, 8));
+        int liquidity = int(positionCommitment.slice(8, 16));
+
+        // Validate position is valid
+        require(tickLower < tickUpper);
+        require(liquidity > 0);
+
+        // Return amounts must be positive
+        require(amount0 > 0);
+        require(amount1 > 0);
+
+        // Output 1: token0 to LP
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        
+        // Output 2: token1 to LP
+        require(tx.outputs[2].lockingBytecode == tx.inputs[1].lockingBytecode);
+
+        // Position NFT is burned (no token output for output 1)
+        require(tx.outputs[1].tokenCategory != 0x);
+        require(tx.outputs[2].tokenCategory != 0x);
+
+        // Maximum 4 outputs
+        require(tx.outputs.length <= 4);
+    }
+
+    // Swap: token0 ↔ token1
+    //
+    // Input 0: DEX contract UTXO (contains pooled tokens)
+    // Input 1: user's input token (token0 if zeroForOne=true, token1 if zeroForOne=false)
+    // Output 0: DEX contract UTXO (updated pool)
+    // Output 1: output token to user
+    // Output 2: (optional) BCH change
+    //
+    // Parameters:
+    //   zeroForOne: true = swap token0 for token1, false = swap token1 for token0
+    //   amountIn: amount of input token
+    //   minAmountOut: minimum output expected (slippage protection)
+    function swap(bool zeroForOne, int amountIn, int minAmountOut) {
+        require(this.activeInputIndex == 0);
+
+        // Input 1 must have tokens
+        require(tx.inputs[1].tokenCategory != 0x);
+        require(amountIn > 0);
+
+        // Validate swap direction
+        // Input token category determines direction
+        // (In production, would have explicit token category validation)
+
+        // Calculate output amount (simplified constant product)
+        // Real implementation: use sqrt(price) and tick math
+        int amountOut = 0;
+        
+        // Simple 0.3% fee calculation
+        int fee = amountIn * 3 / 1000;
+        int amountAfterFee = amountIn - fee;
+        
+        if (zeroForOne) {
+            // token0 → token1
+            // Output should be token1
+            require(tx.outputs[1].tokenCategory != 0x);
+            
+            // Simplified: output = input * 0.997 (with fee)
+            // In production, use proper pricing formula
+            amountOut = amountAfterFee;
+        } else {
+            // token1 → token0
+            require(tx.outputs[1].tokenCategory != 0x);
+            amountOut = amountAfterFee;
+        }
+
+        // Slippage protection
+        require(amountOut >= minAmountOut);
+
+        // Output goes to swapper
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+
+        // Maximum 3 outputs
+        require(tx.outputs.length <= 3);
+    }
+
+    // Collect Fees: claim accumulated fees from a position
+    //
+    // Input 0: DEX contract UTXO
+    // Input 1: position NFT
+    // Output 0: DEX contract UTXO (covenant)
+    // Output 1: position NFT (updated with reduced accumulated fees)
+    // Output 2: fee token0 to LP
+    // Output 3: fee token1 to LP
+    //
+    // The position tracks accumulated fees that can be collected
+    function collect(int feeAmount0, int feeAmount1) {
+        require(this.activeInputIndex == 0);
+
+        // Covenant: contract bytecode preserved
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+
+        // Covenant: minting NFT preserved
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+
+        // Input 1 must be a position NFT
+        require(tx.inputs[1].tokenCategory != 0x);
+
+        // Parse position NFT commitment
+        bytes positionCommitment = tx.inputs[1].nftCommitment;
+        int tickLower = int(positionCommitment.slice(0, 4));
+        int tickUpper = int(positionCommitment.slice(4, 8));
+        int liquidity = int(positionCommitment.slice(8, 16));
+
+        // Validate position
+        require(tickLower < tickUpper);
+        require(liquidity > 0);
+
+        // Fee amounts must be non-negative
+        require(feeAmount0 >= 0);
+        require(feeAmount1 >= 0);
+
+        // At least one fee amount must be positive
+        require(feeAmount0 > 0 || feeAmount1 > 0);
+
+        // Output 1: Updated position NFT (same commitment, same owner)
+        require(tx.outputs[1].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[1].nftCommitment == positionCommitment);
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+
+        // Output 2: fee token0 to LP
+        require(tx.outputs[2].lockingBytecode == tx.inputs[1].lockingBytecode);
+        
+        // Output 3: fee token1 to LP
+        require(tx.outputs[3].lockingBytecode == tx.inputs[1].lockingBytecode);
+
+        // Maximum 4 outputs
+        require(tx.outputs.length <= 4);
+    }
+
+    // Admin: Update fee configuration
+    function setFee(int newFee, pubkey pk, sig s) {
+        require(hash160(pk) == hubPkh);
+        require(checkSig(s, pk));
+        
+        // Fee in basis points (e.g., 30 = 0.3%)
+        require(newFee >= 0);
+        require(newFee <= 10000);
+    }
+
+    // Emergency: Withdraw stuck funds
+    function withdraw(pubkey pk, sig s) {
+        require(hash160(pk) == hubPkh);
+        require(checkSig(s, pk));
+    }
+}

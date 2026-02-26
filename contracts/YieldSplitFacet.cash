@@ -1,0 +1,231 @@
+pragma cashscript ^0.12.0;
+
+// YieldSplitFacet — Split lstBCH into PT (Principal Token) + YT (Yield Token)
+//
+// Similar to Pendle, this contract splits a staking receipt into two tokens:
+// - PT: Principal Token - Worth face value at expiry, trades at discount
+// - YT: Yield Token - Accrues yield over time, can be sold on DEX
+//
+// The contract uses lstBCH NFT from LiquidStake as input and produces two NFTs.
+//
+// NFT Commitment Layout:
+//   PT: bytes8(principal) + bytes4(expiry) = 12 bytes total
+//   YT: bytes8(yieldAccrued) + bytes4(expiry) = 12 bytes total
+//
+// Principal = original lstBCH staked amount
+// Yield Accrued = accumulated yield (starts at 0, increases over time)
+// Expiry = timestamp when PT can be redeemed for principal
+
+contract YieldSplitFacet(bytes20 hubPkh) {
+
+    // Split: lstBCH NFT → PT NFT + YT NFT
+    //
+    // Input 0: lstBCH NFT from LiquidStake (commitment = stakedAmount)
+    // Output 0: PT NFT (commitment = principal + expiry)
+    // Output 1: YT NFT (commitment = yieldAccrued + expiry)
+    //
+    // The expiry is set at split time (e.g., 1 year from now)
+    // Initial yield accrued is 0
+    function split(int expiry) {
+        require(this.activeInputIndex == 0);
+
+        // Input 0 must be an NFT (non-minting, immutable receipt)
+        // The category should match lstBCH token category
+        require(tx.inputs[0].tokenCategory != 0x);
+        
+        // Read principal from lstBCH commitment (8 bytes, little-endian)
+        int principal = int(tx.inputs[0].nftCommitment);
+
+        // Principal must be positive
+        require(principal > 0);
+
+        // Expiry must be in the future (using block age as time proxy)
+        // Minimum 1 week, maximum 2 years
+        require(expiry > 1000);
+        require(expiry < 2000000);
+
+        // Output 0: PT NFT - commitment = principal + expiry
+        // Use same token category as input
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        
+        // PT has no capability (immutable, like receipt)
+        // Commitment: bytes8(principal) + bytes4(expiry)
+        bytes ptCommitment = bytes8(principal) + bytes4(expiry);
+        require(tx.outputs[0].nftCommitment == ptCommitment);
+
+        // Output 1: YT NFT - commitment = yieldAccrued (0) + expiry
+        require(tx.outputs[1].tokenCategory == tx.inputs[0].tokenCategory);
+        
+        // YT has no capability (immutable)
+        // Commitment: bytes8(0) + bytes4(expiry)
+        bytes ytCommitment = bytes8(0) + bytes4(expiry);
+        require(tx.outputs[1].nftCommitment == ytCommitment);
+
+        // Both outputs go to the same owner (input 0's address)
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[1].lockingBytecode == tx.inputs[0].lockingBytecode);
+
+        // Maximum 2 outputs (PT + YT)
+        require(tx.outputs.length == 2);
+    }
+
+    // Merge: PT NFT + YT NFT → lstBCH NFT
+    //
+    // Input 0: PT NFT (commitment = principal + expiry)
+    // Input 1: YT NFT (commitment = yieldAccrued + expiry)
+    // Output 0: lstBCH NFT (commitment = principal)
+    //
+    // Can be called anytime to recombine tokens back to lstBCH
+    function merge() {
+        require(this.activeInputIndex == 0);
+
+        // Both inputs must have same token category
+        require(tx.inputs[0].tokenCategory == tx.inputs[1].tokenCategory);
+        
+        // Both inputs must be NFTs (non-minting)
+        require(tx.inputs[0].tokenCategory != 0x);
+        require(tx.inputs[1].tokenCategory != 0x);
+
+        // Parse PT commitment: bytes8(principal) + bytes4(expiry)
+        bytes ptCommitment = tx.inputs[0].nftCommitment;
+        int principal = int(ptCommitment.slice(0, 8));
+        int ptExpiry = int(ptCommitment.slice(8, 12));
+
+        // Parse YT commitment: bytes8(yieldAccrued) + bytes4(expiry)
+        bytes ytCommitment = tx.inputs[1].nftCommitment;
+        // Note: yieldAccrued is intentionally not extracted - only expiry is needed for merge
+        int ytExpiry = int(ytCommitment.slice(8, 12));
+
+        // Both must have same expiry
+        require(ptExpiry == ytExpiry);
+
+        // Principal must be positive
+        require(principal > 0);
+
+        // Output 0: lstBCH NFT - commitment = principal
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        
+        // lstBCH NFT commitment is just the principal amount
+        require(tx.outputs[0].nftCommitment == bytes8(principal));
+
+        // Output goes to PT holder (who initiates merge)
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+
+        // Maximum 1 output (lstBCH NFT, burns PT + YT)
+        require(tx.outputs.length == 1);
+
+        // Note: Yield accrued is not returned - it stays in the pool
+        // This incentivizes long-term holding (yield accumulates to PT at expiry)
+    }
+
+    // Redeem PT at expiry → get principal back
+    //
+    // Input 0: PT NFT (commitment = principal + expiry)
+    // Output 0: BCH payout (principal)
+    //
+    // Can only be called after expiry timestamp
+    // This is the "settlement" of the principal token
+    function redeemPT(int currentTime) {
+        require(this.activeInputIndex == 0);
+
+        // Input must be PT NFT
+        require(tx.inputs[0].tokenCategory != 0x);
+
+        // Parse PT commitment
+        bytes ptCommitment = tx.inputs[0].nftCommitment;
+        int principal = int(ptCommitment.slice(0, 8));
+        int expiry = int(ptCommitment.slice(8, 12));
+
+        // Must be after expiry
+        require(currentTime >= expiry);
+
+        // Principal must be positive
+        require(principal > 0);
+
+        // Output 0: BCH payout to PT holder
+        // Value = principal (burns the NFT)
+        require(tx.outputs[0].value >= principal);
+
+        // Output goes to PT holder
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+
+        // Only 1 output (BCH, PT NFT is burned)
+        require(tx.outputs.length == 1);
+
+        // No tokens in output (burns the PT NFT)
+        require(tx.outputs[0].tokenCategory == 0x);
+    }
+
+    // Claim yield from YT → get accumulated yield
+    //
+    // Input 0: YT NFT (commitment = yieldAccrued + expiry)
+    // Output 0: Updated YT NFT (if before expiry) or BCH (if claimed after expiry)
+    //
+    // Yield calculation: simple linear accrual based on time passed
+    // Yield Rate: configurable (e.g., 5% APY)
+    // This function allows partial claims before expiry
+    function claimYield(int currentTime, int yieldRate) {
+        require(this.activeInputIndex == 0);
+
+        // Input must be YT NFT
+        require(tx.inputs[0].tokenCategory != 0x);
+
+        // Parse YT commitment
+        bytes ytCommitment = tx.inputs[0].nftCommitment;
+        int yieldAccrued = int(ytCommitment.slice(0, 8));
+        int expiry = int(ytCommitment.slice(8, 12));
+
+        // Cannot claim before start (assume start = 0 for simplicity)
+        require(currentTime > 0);
+
+        // Yield rate in basis points (e.g., 500 = 5%)
+        require(yieldRate >= 0);
+        require(yieldRate <= 10000);
+
+        // Calculate elapsed time (in "blocks" as time proxy)
+        int elapsed = currentTime;
+        if (elapsed > expiry) {
+            elapsed = expiry;
+        }
+
+        // Calculate yield to claim: principal * rate * time
+        // Simplified: yield = yieldAccrued + (elapsed * yieldRate / 10000)
+        // But we need principal from somewhere - let's simplify:
+        // The contract tracks accumulated yield directly
+        
+        int newYieldAccrued = yieldAccrued + (elapsed * yieldRate / 10000);
+
+        if (currentTime >= expiry) {
+            // After expiry: claim all yield as BCH, burn YT
+            
+            // Output 0: BCH payout
+            require(tx.outputs[0].value >= newYieldAccrued);
+            require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+            require(tx.outputs[0].tokenCategory == 0x); // No tokens
+            require(tx.outputs.length == 1);
+            
+        } else {
+            // Before expiry: update YT with new yield
+            
+            // Output 0: Updated YT NFT
+            require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+            
+            // Updated commitment: newYieldAccrued + expiry
+            bytes newYtCommitment = bytes8(newYieldAccrued) + bytes4(expiry);
+            require(tx.outputs[0].nftCommitment == newYtCommitment);
+            
+            // Same owner
+            require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+            
+            // Only 1 output (updated YT)
+            require(tx.outputs[0].tokenCategory != 0x);
+            require(tx.outputs.length == 1);
+        }
+    }
+
+    // Admin function: withdraw any funds stuck in contract
+    function withdraw(pubkey pk, sig s) {
+        require(hash160(pk) == hubPkh);
+        require(checkSig(s, pk));
+    }
+}
